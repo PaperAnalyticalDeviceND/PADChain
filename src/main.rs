@@ -11,11 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use std::error;
+use std::fmt;
+
 extern crate crypto;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Block {
     data: String,
     timestamp: i64,
@@ -45,38 +48,98 @@ impl Block {
         hasher.input(self.validator_address.as_bytes());
         self.block_hash = hasher.result_str();
     }
+
+    fn blank_hash() -> String {
+        Block::new(String::from(""), String::from(""), String::from("")).block_hash
+    }
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Debug)]
+pub enum BlockchainError {
+    UnknownValidator,
+}
+
+impl fmt::Display for BlockchainError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            BlockchainError::UnknownValidator => write!(f, "could not suggest block, address has no stake"),
+        }
+    }
+}
+
+impl error::Error for BlockchainError {
+    fn description(&self) -> &str {
+        match *self {
+            BlockchainError::UnknownValidator => "could not mine block, hit iteration limit",
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        None
+    }
+}
+
+#[derive(Debug)]
 pub struct Chain {
     chain: Vec<Block>,
+    candidates: Vec<Block>,
+    validators: BTreeMap<String, u32>,
+    stake: BTreeMap<String, u32>,
 }
 
 impl Chain {
     pub fn new() -> Chain {
-        let chain = Chain { chain: Vec::new() };
+        let chain = Chain { 
+            chain: Vec::new(),
+            candidates: Vec::new(),
+            validators: BTreeMap::new(),
+            stake: BTreeMap::new(),
+         };
         chain
     }
 
-    pub fn new_block(&mut self, block: Block) {}
-}
-
-pub fn select_winner(validators: &BTreeMap<String, u32>) -> String {
-    let mut rng = rand::thread_rng();
-
-    let max: u32 = validators.values().sum();
-    let winning_ticket: u32 = rng.gen_range(0, max);
-
-    let mut last_value: u32 = 0;
-    let mut winning_key = String::from("");
-    for (key, &value) in validators {
-        if winning_ticket > last_value && winning_ticket <= last_value + value {
-            winning_key = key.clone();
+    pub fn suggest_block(&mut self, data: String, validator: String) -> Result<(),BlockchainError> {
+        let stake = self.stake.get(&validator);
+        if stake == None {
+            return Err(BlockchainError::UnknownValidator);
         }
-        last_value = value;
+
+        let blank_hash = Block::blank_hash();
+        let prev_hash = match self.chain.last(){
+            Some(b) => &b.block_hash,
+            None => &blank_hash,
+        };
+
+        self.candidates.push(Block::new(data, prev_hash.to_string(), validator.clone()));
+        self.validators.insert(validator.clone(), *stake.unwrap());
+
+        Ok(())
     }
 
-    winning_key
+    pub fn select_winner(&mut self) {
+        let mut rng = rand::thread_rng();
+
+        let max: u32 = self.validators.values().sum();
+        let winning_ticket: u32 = rng.gen_range(0, max);
+
+        let mut last_value: u32 = 0;
+        let mut winning_key = String::from("");
+        for (key, value) in &self.validators {
+            if winning_ticket > last_value && winning_ticket <= last_value + value {
+                winning_key = key.clone();
+            }
+            last_value = *value;
+        }
+
+        for block in &self.candidates {
+            if block.validator_address == winning_key {
+                self.chain.push((*block).clone());
+                break;
+            }
+        }
+        self.validators.clear();
+        self.candidates.clear();
+    }
 }
 
 fn main() {
@@ -93,26 +156,32 @@ fn main() {
         println!("{:#?}", chain_temp.lock().unwrap().chain);
     }
 
-    let validators = Arc::new(Mutex::new(BTreeMap::new()));
     {
-        let validators_temp = validators.clone();
-        validators_temp
+        let chain_temp = chain.clone();
+        chain_temp
             .lock()
             .unwrap()
+            .stake
             .insert(String::from("000000000000"), 100000);
-        validators_temp
+        chain_temp
             .lock()
             .unwrap()
+            .stake
             .insert(String::from("000000000001"), 50000);
     }
 
-    let chain_validators = validators.clone();
-    let chain_append = thread::spawn(move || loop {
+    {
+        chain.lock().unwrap().suggest_block(String::from("Wallet A"), String::from("000000000000"));
+        chain.lock().unwrap().suggest_block(String::from("Wallet B"), String::from("000000000001"));
+    }
+
+    let append_chain = chain.clone();
+    let append_thread = thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(30));
 
-        let winner = select_winner(&chain_validators.lock().unwrap());
-        println!("{}", winner);
+        append_chain.lock().unwrap().select_winner();
+        println!("{:#?}", append_chain.lock().unwrap().chain);
     });
 
-    chain_append.join().unwrap();
+    append_thread.join().unwrap();
 }
